@@ -98,7 +98,9 @@ print(f"Done, took {time.perf_counter() - tic}")
 def np2pixmap(np_img):
     height, width, channel = np_img.shape
     bytesPerLine = 3 * width
-    qImg = QImage(np_img.data, width, height, bytesPerLine, QImage.Format_RGB888)
+    arr = np.ascontiguousarray(np_img, dtype=np.uint8)
+    qImg = QImage(arr.data, width, height, bytesPerLine, QImage.Format_RGB888)
+    qImg._arr = arr
     return QPixmap.fromImage(qImg)
 
 
@@ -202,10 +204,16 @@ class Window(QWidget):
             exit()
 
         img_np = io.imread(file_path)
-        if len(img_np.shape) == 2:
+        if img_np.ndim == 2:
             img_3c = np.repeat(img_np[:, :, None], 3, axis=-1)
         else:
-            img_3c = img_np
+            # (H,W,4) -> drop alpha
+            if img_np.shape[2] == 4:
+                img_3c = img_np[:, :, :3]
+            elif img_np.shape[2] == 3:
+                img_3c = img_np
+            else:
+                raise ValueError(f"Unexpected channel count: {img_np.shape}")
 
         self.img_3c = img_3c
         self.image_path = file_path
