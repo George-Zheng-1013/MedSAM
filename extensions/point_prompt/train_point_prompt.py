@@ -66,7 +66,99 @@ parser.add_argument(
     default=None,
     help="Path to test patient list (one patient ID per line).",
 )
+parser.add_argument(
+    "-boundary_weight",
+    type=float,
+    default=0.1,
+    help="Weight of boundary loss (0-1). Default: 0.1 (reduced to avoid over-expansion)",
+)
 args = parser.parse_args()
+
+
+def compute_gradient_magnitude(mask):
+    """Compute gradient magnitude (edge strength) of a binary mask.
+    Args:
+        mask: (H, W) binary mask
+    Returns:
+        (H, W) gradient magnitude
+    """
+    gy, gx = np.gradient(mask.astype(np.float32))
+    magnitude = np.sqrt(gx**2 + gy**2 + 1e-8)
+    return magnitude
+
+
+def compute_gradient_direction(mask):
+    """Compute gradient direction of a binary mask.
+    Args:
+        mask: (H, W) binary mask
+    Returns:
+        (H, W, 2) gradient direction (normalized)
+    """
+    gy, gx = np.gradient(mask.astype(np.float32))
+    magnitude = np.sqrt(gx**2 + gy**2 + 1e-8)
+
+    # Avoid division by zero
+    direction = np.stack([gx / (magnitude + 1e-8), gy / (magnitude + 1e-8)], axis=-1)
+    return direction
+
+
+class BoundaryAwareLoss(nn.Module):
+    """Gradient-aligned boundary loss (Kimi's approach).
+
+    Instead of forcing boundary pixels to be foreground, this loss aligns
+    the predicted gradient direction with the true gradient direction.
+    This prevents the over-expansion problem of the original BoundaryAwareLoss.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, logits, boundary_mask, boundary_confidence=None):
+        """
+        Args:
+            logits: (B, 1, H, W) raw predictions
+            boundary_mask: (B, 1, H, W) binary boundary mask (from Canny or Snakes)
+            boundary_confidence: (B, 1, H, W) confidence weights for boundary pixels
+
+        Returns:
+            Boundary gradient alignment loss (positive value)
+        """
+        if boundary_mask is None or boundary_mask.sum() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+        # Compute predicted mask probability
+        pred_probs = torch.sigmoid(logits)  # (B, 1, H, W)
+
+        # Compute gradient magnitude at boundary locations
+        # 关键改进：约束梯度强度而非绝对值
+        # 在边界位置，预测应该从0到1有剧烈变化（梯度强）
+
+        batch_size = logits.shape[0]
+        boundary_loss = 0.0
+
+        for b in range(batch_size):
+            pred_mask = pred_probs[b, 0]  # (H, W)
+            boundary_pts = boundary_mask[b, 0] > 0.5  # (H, W) boolean
+
+            if boundary_pts.sum() == 0:
+                continue
+
+            # Compute predicted gradient magnitude at boundary
+            # 在边界处，预测的梯度应该很大（0→1的剧烈变化）
+            pred_grad = torch.abs(pred_mask[boundary_pts] - 0.5)  # 离0.5越远梯度越强
+
+            if boundary_confidence is not None:
+                conf = boundary_confidence[b, 0][boundary_pts]
+                # Weighted loss: 高置信度的边界点权重更高
+                loss_b = torch.mean((1.0 - pred_grad) * conf)
+            else:
+                # Unweighted: 所有边界点等权
+                loss_b = torch.mean(1.0 - pred_grad)
+
+            boundary_loss = boundary_loss + loss_b
+
+        boundary_loss = boundary_loss / max(batch_size, 1)
+        return boundary_loss
 
 
 # Dataset class
@@ -200,10 +292,63 @@ class NpyDataset(Dataset):
 
         ## Resize to 256x256 for final output
         gt2D_256 = cv2.resize(gt2D, (256, 256), interpolation=cv2.INTER_NEAREST)
+
+        # Ensure uint8 0/255 for edge detection
+        gt2D_256_u8 = (gt2D_256 * 255).astype(np.uint8)
+
+        # Generate boundary mask using Canny edge detection + confidence weighting
+        # (Kimi's approach: image-driven instead of GT-driven)
+
+        # 1. Canny edge detection on resized ground truth (binary 0/255)
+        boundary_edges = cv2.Canny(gt2D_256_u8, threshold1=5, threshold2=20)
+
+        # 2. Compute confidence weight based on:
+        #    - Proximity to GT boundary (distance-based)
+        #    - Local gradient strength
+
+        # Get GT boundary pixels (symmetric boundary using gradient)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        gt_boundary = cv2.morphologyEx(gt2D_256_u8, cv2.MORPH_GRADIENT, kernel)
+        gt_boundary = (gt_boundary > 0).astype(np.uint8)  # Ensure binary
+
+        # Fallback if Canny produces empty edges
+        if boundary_edges.sum() == 0:
+            boundary_edges = gt_boundary * 255
+
+        # Distance transform: pixels closer to true boundary get higher confidence
+        dist_transform = cv2.distanceTransform(
+            (1 - gt_boundary).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+        )
+        max_dist = dist_transform.max() + 1e-8
+        dist_confidence = 1.0 - (dist_transform / max_dist)
+
+        # Gradient strength: compute local contrast using Sobel
+        sobelx = cv2.Sobel(gt2D_256.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gt2D_256.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+        grad_magnitude = np.sqrt(sobelx**2 + sobely**2)
+        max_grad = grad_magnitude.max() + 1e-8
+        grad_confidence = grad_magnitude / max_grad
+
+        # Combine confidences: canny edges + proximity + gradient strength
+        boundary_mask_256 = (boundary_edges / 255.0).astype(np.float32)
+        boundary_confidence_256 = boundary_mask_256 * (
+            0.5 * dist_confidence + 0.5 * grad_confidence
+        )
+
+        # Filter low-confidence points to avoid noise
+        conf_threshold = 0.1
+        boundary_mask_256 = (boundary_confidence_256 > conf_threshold).astype(
+            np.float32
+        )
+
         return {
             "image": torch.tensor(img_1024).float(),
             "gt2D": torch.tensor(gt2D_256[None, :, :]).long(),
             "coords": torch.tensor(coords[None, ...]).float(),
+            "boundary_mask": torch.tensor(boundary_mask_256[None, :, :]).float(),
+            "boundary_confidence": torch.tensor(
+                boundary_confidence_256[None, :, :]
+            ).float(),
             "image_name": img_name,
         }
 
@@ -327,6 +472,7 @@ if __name__ == "__main__":
 
     seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
     ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
+    boundary_loss_fn = BoundaryAwareLoss()
 
     val_list = load_patient_list(args.val_list)
     test_list = load_patient_list(args.test_list)
@@ -375,11 +521,15 @@ if __name__ == "__main__":
         medsam_model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_epoch = checkpoint["epoch"] + 1
-        best_loss = checkpoint["best_loss"]
-        print(f"Loaded checkpoint from epoch {start_epoch}, best loss: {best_loss:.4f}")
+        best_loss = checkpoint.get("best_loss", 1e10)
+        best_val_dice = checkpoint.get("best_val_dice", 0.0)
+        print(
+            f"Loaded checkpoint from epoch {start_epoch}, best loss: {best_loss:.4f}, best val dice: {best_val_dice:.4f}"
+        )
     else:
         start_epoch = 0
         best_loss = 1e10
+        best_val_dice = 0.0
     torch.cuda.empty_cache()
 
     epoch_time = []
@@ -391,29 +541,61 @@ if __name__ == "__main__":
         for step, batch in enumerate(pbar):
             image = batch["image"]
             gt2D = batch["gt2D"]
-            coords_torch = batch["coords"]  # (B, 2)
+            coords_torch = batch["coords"]
+            boundary_mask = batch.get("boundary_mask", None)
+            boundary_confidence = batch.get("boundary_confidence", None)
             optimizer.zero_grad()
-            labels_torch = torch.ones(coords_torch.shape[0]).long()  # (B,)
-            labels_torch = labels_torch.unsqueeze(1)  # (B, 1)
+            labels_torch = torch.ones(coords_torch.shape[0]).long()
+            labels_torch = labels_torch.unsqueeze(1)
             image, gt2D = image.to(device), gt2D.to(device).float()
             coords_torch, labels_torch = coords_torch.to(device), labels_torch.to(
                 device
             )
+            if boundary_mask is not None:
+                boundary_mask = boundary_mask.to(device)
+            if boundary_confidence is not None:
+                boundary_confidence = boundary_confidence.to(device)
+
+            boundary_mean = None
+            if boundary_mask is not None:
+                # 平均每个样本的边界像素数（用于调试边界监督是否有效）
+                boundary_mean = boundary_mask.sum(dim=(1, 2, 3)).mean().item()
+
             point_prompt = (coords_torch, labels_torch)
             medsam_lite_pred = medsam_model(image, point_prompt)
             loss = seg_loss(medsam_lite_pred, gt2D) + ce_loss(medsam_lite_pred, gt2D)
+
+            # Add gradient-aligned boundary loss (Kimi's improved version)
+            boundary_loss_val = boundary_loss_fn(
+                medsam_lite_pred, boundary_mask, boundary_confidence
+            )
+            loss = loss + args.boundary_weight * boundary_loss_val
+
             epoch_loss[step] = loss.item()
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             pbar.set_description(
                 f"Epoch {epoch} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, loss: {loss.item():.4f}"
+                + (
+                    f", boundary_mean: {boundary_mean:.2f}"
+                    if boundary_mean is not None
+                    else ""
+                )
             )
 
         epoch_end_time = time()
         epoch_time.append(epoch_end_time - epoch_start_time)
         epoch_loss_reduced = sum(epoch_loss) / len(epoch_loss)
         losses.append(epoch_loss_reduced)
+
+        # Evaluate on validation set
+        val_dice, val_iou = 0.0, 0.0
+        if val_loader is not None:
+            val_dice, val_iou = evaluate(medsam_model, val_loader)
+            print(f"Validation Dice: {val_dice:.4f}, IoU: {val_iou:.4f}")
+
+        # Save checkpoint
         model_weights = medsam_model.state_dict()
         checkpoint = {
             "model": model_weights,
@@ -421,18 +603,30 @@ if __name__ == "__main__":
             "optimizer": optimizer.state_dict(),
             "loss": epoch_loss_reduced,
             "best_loss": best_loss,
+            "val_dice": val_dice,
+            "val_iou": val_iou,
+            "best_val_dice": best_val_dice,
         }
-        if epoch_loss_reduced < best_loss:
-            print(f"New best loss: {best_loss:.4f} -> {epoch_loss_reduced:.4f}")
-            best_loss = epoch_loss_reduced
-            checkpoint["best_loss"] = best_loss
-            torch.save(checkpoint, join(work_dir, "medsam_point_prompt_best.pth"))
+
+        # Save best model based on validation Dice (if available) or training loss
+        if val_loader is not None:
+            # Use validation Dice as criterion
+            if val_dice > best_val_dice:
+                print(
+                    f"New best validation Dice: {best_val_dice:.4f} -> {val_dice:.4f}"
+                )
+                best_val_dice = val_dice
+                checkpoint["best_val_dice"] = best_val_dice
+                torch.save(checkpoint, join(work_dir, "medsam_point_prompt_best.pth"))
+        else:
+            # Fallback to training loss if no validation set
+            if epoch_loss_reduced < best_loss:
+                print(f"New best loss: {best_loss:.4f} -> {epoch_loss_reduced:.4f}")
+                best_loss = epoch_loss_reduced
+                checkpoint["best_loss"] = best_loss
+                torch.save(checkpoint, join(work_dir, "medsam_point_prompt_best.pth"))
 
         torch.save(checkpoint, join(work_dir, "medsam_point_prompt_latest.pth"))
-
-        if val_loader is not None:
-            val_dice, val_iou = evaluate(medsam_model, val_loader)
-            print(f"Validation Dice: {val_dice:.4f}, IoU: {val_iou:.4f}")
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
         ax1.plot(losses)
