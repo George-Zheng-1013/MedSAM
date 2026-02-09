@@ -196,7 +196,11 @@ def _build_soft_probs(mask: np.ndarray, num_classes: int) -> np.ndarray:
 
 
 def _apply_crf(
-    image: np.ndarray, mask: np.ndarray, num_classes: int, iters: int
+    image: np.ndarray,
+    mask: np.ndarray,
+    num_classes: int,
+    iters: int,
+    soft_probs: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     import pydensecrf.densecrf as dcrf
     from pydensecrf.utils import unary_from_softmax
@@ -213,7 +217,18 @@ def _apply_crf(
     image_rgb = np.ascontiguousarray(image_rgb)
 
     h, w = mask.shape
-    probs = _build_soft_probs(mask, num_classes)
+
+    probs = soft_probs.astype(np.float32)
+    if probs.ndim == 2:
+        # Binary foreground prob -> two-class softmax-like probs
+        fg = np.clip(probs, 0.0, 1.0)
+        bg = 1.0 - fg
+        probs = np.stack([bg, fg], axis=0)
+    elif probs.ndim == 3 and probs.shape[-1] == num_classes:
+        probs = np.transpose(probs, (2, 0, 1))
+    if probs.shape[0] != num_classes or probs.shape[1:] != (h, w):
+        raise ValueError("soft_probs must be (C,H,W) or (H,W,C) or (H,W)")
+    
     eps = 1e-4
     probs = probs * (1.0 - eps) + (eps / float(num_classes))
     unary = unary_from_softmax(probs)
@@ -234,6 +249,7 @@ def apply_topology_postprocess(
     point_coords: Optional[np.ndarray] = None,
     point_labels: Optional[np.ndarray] = None,
     class_names: Optional[Dict[int, str]] = None,
+    soft_probs: Optional[np.ndarray] = None,
     config: Optional[TopologyPostprocessConfig] = None,
 ) -> Dict[str, object]:
     if config is None:
@@ -296,6 +312,8 @@ def apply_topology_postprocess(
 
     if config.crf_enabled:
         num_classes = int(refined.max()) + 1
-        refined = _apply_crf(image, refined, num_classes, config.crf_iters)
+        refined = _apply_crf(
+            image, refined, num_classes, config.crf_iters, soft_probs=soft_probs
+        )
 
     return {"mask": refined, "stats": stats}
